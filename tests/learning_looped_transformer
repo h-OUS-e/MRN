@@ -4,202 +4,203 @@ import torch.optim as optim
 import random
 import matplotlib.pyplot as plt
 
-# Check device
+# Device Config
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Running on: {device}")
 
 # ==========================================
-# 1. DATA GENERATION
+# 1. DECIMAL DATA GENERATOR
 # ==========================================
-def generate_batch(batch_size, bits):
+def generate_decimal_batch(batch_size, length):
     X, Y = [], []
+    
+    # We always define the sequence length as N + 1
+    # This guarantees space for the final carry.
+    seq_len = length + 1
+    
     for _ in range(batch_size):
-        a = random.randint(0, 2**bits - 1)
-        b = random.randint(0, 2**bits - 1)
-        c = a + b
+        # 1. Generate random numbers of 'length' digits
+        # e.g., if length=2, max is 99.
+        max_val = (10 ** length) - 1
+        a = random.randint(0, max_val)
+        b = random.randint(0, max_val)
+        c = a + b # Real sum (e.g., 99+99=198)
         
-        a_bin = [int(x) for x in format(a, f'0{bits}b')[::-1]]
-        b_bin = [int(x) for x in format(b, f'0{bits}b')[::-1]]
-        c_bin = [int(x) for x in format(c, f'0{bits}b')[::-1]]
+        # 2. Extract digits for the FULL sequence (length + 1)
+        # We grab digits 0 to 'length'.
+        # If the number is small (e.g. 50+20=70), the last digit will naturally be 0.
+        a_seq = [(a // (10**i)) % 10 for i in range(seq_len)]
+        b_seq = [(b // (10**i)) % 10 for i in range(seq_len)]
+        c_seq = [(c // (10**i)) % 10 for i in range(seq_len)]
         
-        # Handle overflow/padding
-        if len(c_bin) < bits: c_bin += [0] * (bits - len(c_bin))
-        c_bin = c_bin[:bits]
+        # 3. Stack inputs
+        # The last position of input will always be [0, 0]
+        # The AI sees this and thinks "Ah, a blank space for me to write the carry."
+        x_seq = [[d_a, d_b] for d_a, d_b in zip(a_seq, b_seq)]
         
-        x_seq = [[a_val, b_val] for a_val, b_val in zip(a_bin, b_bin)]
         X.append(x_seq)
-        Y.append(c_bin)
+        Y.append(c_seq)
         
-    return torch.tensor(X).float().to(device), torch.tensor(Y).long().to(device)
+    return torch.tensor(X).long().to(device), torch.tensor(Y).long().to(device)
 
 # ==========================================
-# 2. STANDARD TRANSFORMER (The Baseline)
+# 2. STANDARD DECIMAL TRANSFORMER
 # ==========================================
-class StandardTransformer(nn.Module):
-    def __init__(self, input_dim, d_model, nhead, num_layers=4, max_len=100):
+class StandardDecimalTransformer(nn.Module):
+    def __init__(self, d_model, nhead, num_layers=4, max_len=100):
         super().__init__()
-        self.embedding = nn.Linear(input_dim, d_model)
-        # Absolute Positional Encoding (The "Memorization" Trap)
+        # Embedding for digits 0-9
+        self.digit_embedding = nn.Embedding(10, d_model)
+        
+        # Absolute Positional Encoding
         self.pos_embedding = nn.Parameter(torch.randn(1, max_len, d_model) * 0.1)
         
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, norm_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.output_head = nn.Linear(d_model, 2)
-
-    def forward(self, x, num_loops=None): # num_loops ignored for Standard
-        seq_len = x.shape[1]
-        # Add absolute position (up to current length)
-        # If seq_len > max_len, this crashes or requires slicing (we slice here)
-        pos = self.pos_embedding[:, :seq_len, :]
-        x = self.embedding(x) + pos
-        x = self.transformer(x)
-        return self.output_head(x)
-
-# ==========================================
-# 3. LOOPED TRANSFORMER (The Fix)
-# ==========================================
-class LoopedTransformerRelative(nn.Module):
-    def __init__(self, input_dim, d_model, nhead, max_relative_dist=4):
-        super().__init__()
-        self.embedding = nn.Linear(input_dim, d_model)
         
-        # Learned Relative Bias Table
+        # Output 10 classes (digits 0-9)
+        self.output_head = nn.Linear(d_model, 10)
+
+    def forward(self, x, num_loops=None):
+        seq_len = x.shape[1]
+        
+        # Embed the two input digits separately and sum them
+        # x[:,:,0] is digit A, x[:,:,1] is digit B
+        emb_a = self.digit_embedding(x[:,:,0])
+        emb_b = self.digit_embedding(x[:,:,1])
+        h = emb_a + emb_b # Combine
+        
+        # Add position
+        h = h + self.pos_embedding[:, :seq_len, :]
+        
+        h = self.transformer(h)
+        return self.output_head(h)
+
+# ==========================================
+# 3. LOOPED DECIMAL TRANSFORMER
+# ==========================================
+class LoopedDecimalTransformer(nn.Module):
+    def __init__(self, d_model, nhead, max_relative_dist=4):
+        super().__init__()
+        self.digit_embedding = nn.Embedding(10, d_model)
+        
+        # Relative Bias
         self.max_relative_dist = max_relative_dist
-        # Range [-dist, +dist] -> size is 2*dist + 1
         self.relative_bias_table = nn.Parameter(torch.Tensor(1, nhead, 2 * max_relative_dist + 1))
         nn.init.xavier_uniform_(self.relative_bias_table)
         
         self.shared_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=d_model*4, batch_first=True, norm_first=True
         )
-        self.output_head = nn.Linear(d_model, 2)
+        self.output_head = nn.Linear(d_model, 10)
         self.input_gate = nn.Parameter(torch.tensor(0.1))
 
     def get_relative_bias(self, seq_len, device):
         range_vec = torch.arange(seq_len, device=device)
         distance_mat = range_vec[None, :] - range_vec[:, None]
-        
-        # CRITICAL: Clamp distance to Trained Window (e.g., -4 to 4)
         distance_mat_clamped = torch.clamp(distance_mat, -self.max_relative_dist, self.max_relative_dist)
         final_indices = distance_mat_clamped + self.max_relative_dist
-        
-        bias = self.relative_bias_table[0, :, final_indices.long()] # [nhead, L, L]
-        
-        # Causal Mask (Prevent cheating by looking ahead)
+        bias = self.relative_bias_table[0, :, final_indices.long()]
         causal_mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=device), diagonal=1)
         return bias + causal_mask.unsqueeze(0)
 
     def forward(self, x, num_loops=None):
         B, seq_len, _ = x.shape
-        # Adaptive Depth: If input is longer, think longer.
         if num_loops is None:
-            num_loops = seq_len + 5 
+            num_loops = seq_len + 5
 
-        input_emb = self.embedding(x)
+        # Embed Inputs
+        emb_a = self.digit_embedding(x[:,:,0])
+        emb_b = self.digit_embedding(x[:,:,1])
+        input_emb = emb_a + emb_b
         h = input_emb.clone()
         
-        # Get Bias
         relative_bias = self.get_relative_bias(seq_len, x.device)
-        attn_mask = relative_bias.repeat(B, 1, 1) # Repeat for batch
+        attn_mask = relative_bias.repeat(B, 1, 1)
 
         for _ in range(num_loops):
             h_new = self.shared_layer(h, src_mask=attn_mask)
-            # Input Injection (Skip Connection to Input)
             h = h_new + (self.input_gate * input_emb)
             
         return self.output_head(h)
 
 # ==========================================
-# 4. EXPERIMENT RUNNER
+# 4. TRAINING & PLOTTING
 # ==========================================
-def train_model(model_class, name, kwargs):
-    print(f"\n--- Training {name} ---")
-    model = model_class(**kwargs).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+def train_and_compare():
+    D_MODEL = 128 # Slightly larger for decimal complexity
+    NHEAD = 4
+    
+    # 1. Setup Models
+    std_model = StandardDecimalTransformer(D_MODEL, NHEAD, num_layers=4).to(device)
+    loop_model = LoopedDecimalTransformer(D_MODEL, NHEAD, max_relative_dist=4).to(device) # Window=4
+    
+    optimizers = {
+        "Standard": optim.Adam(std_model.parameters(), lr=0.001),
+        "Looped": optim.Adam(loop_model.parameters(), lr=0.001)
+    }
+    
     criterion = nn.CrossEntropyLoss()
     
-    # Train on 8-bit ONLY
-    for step in range(12001):
-        optimizer.zero_grad()
-        X, Y = generate_batch(64, bits=8)
+    print("--- Training Phase (8-Digit Numbers) ---")
+    # Train both for 2000 steps
+    for step in range(2001):
+        X, Y = generate_decimal_batch(64, length=8)
         
-        # Use 12 loops for training (8 bits + buffer)
-        # Standard model ignores this argument
-        output = model(X, num_loops=12) 
+        # Train Standard
+        opt = optimizers["Standard"]
+        opt.zero_grad()
+        out = std_model(X)
+        loss_std = criterion(out.reshape(-1, 10), Y.reshape(-1))
+        loss_std.backward()
+        opt.step()
         
-        loss = criterion(output.reshape(-1, 2), Y.reshape(-1))
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        # Train Looped
+        opt = optimizers["Looped"]
+        opt.zero_grad()
+        out = loop_model(X, num_loops=12) # 8 digits + buffer
+        loss_loop = criterion(out.reshape(-1, 10), Y.reshape(-1))
+        loss_loop.backward()
+        opt.step()
         
         if step % 500 == 0:
-            acc = (output.argmax(-1) == Y).float().mean()
-            print(f"Step {step}: Loss {loss.item():.4f}, Train Acc (8-bit): {acc:.2f}")
-            
-    return model
+            print(f"Step {step}: Std Loss {loss_std.item():.3f} | Loop Loss {loss_loop.item():.3f}")
 
-def evaluate_length_generalization(model, name, test_lengths):
-    accuracies = []
-    print(f"Evaluating {name}...", end=" ")
-    for L in test_lengths:
+    print("\n--- Generalization Test (Length 8 to 24) ---")
+    lengths = [8, 12, 16, 20, 24]
+    std_accs = []
+    loop_accs = []
+    
+    for L in lengths:
         with torch.no_grad():
-            X, Y = generate_batch(100, bits=L)
-            # Dynamic Loops: Scale loops with problem length L
-            # Standard model will ignore this and use fixed layers
-            output = model(X, num_loops=L + 5) 
-            acc = (output.argmax(-1) == Y).float().mean().item()
-            accuracies.append(acc)
-    print("Done.")
-    return accuracies
+            X_test, Y_test = generate_decimal_batch(100, length=L)
+            
+            # Test Standard
+            out_std = std_model(X_test)
+            acc_s = (out_std.argmax(-1) == Y_test).float().mean().item()
+            std_accs.append(acc_s)
+            
+            # Test Looped (Scale loops with length)
+            out_loop = loop_model(X_test, num_loops=L + 5)
+            acc_l = (out_loop.argmax(-1) == Y_test).float().mean().item()
+            loop_accs.append(acc_l)
+            
+    # Print Table
+    print(f"{'Length':<10} | {'Standard Acc':<15} | {'Looped Acc':<15}")
+    print("-" * 45)
+    for i, L in enumerate(lengths):
+        print(f"{L:<10} | {std_accs[i]:.2f}{'':<11} | {loop_accs[i]:.2f}")
 
-# ==========================================
-# 5. EXECUTION & PLOTTING
-# ==========================================
+    # Plot
+    plt.figure(figsize=(8, 5))
+    plt.plot(lengths, std_accs, 'r-o', label='Standard (Memorization)')
+    plt.plot(lengths, loop_accs, 'g-o', label='Looped (Abstraction)')
+    plt.axvline(x=8, color='gray', linestyle='--', label='Training Cutoff')
+    plt.title("Decimal Addition: Generalization to Long Numbers")
+    plt.xlabel("Number of Digits")
+    plt.ylabel("Accuracy")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
 
-# Parameters
-D_MODEL = 64
-NHEAD = 4
-INPUT_DIM = 2
-
-# 1. Train Standard (Fixed Depth = 4 Layers, Absolute Pos)
-std_model = train_model(
-    StandardTransformer, 
-    "Standard Transformer", 
-    {"input_dim": INPUT_DIM, "d_model": D_MODEL, "nhead": NHEAD, "num_layers": 4}
-)
-
-# 2. Train Looped (Relative Pos, Window=4)
-# Note: max_relative_dist=4 ensures we cover the window within 8-bit training
-looped_model = train_model(
-    LoopedTransformerRelative, 
-    "Looped Transformer", 
-    {"input_dim": INPUT_DIM, "d_model": D_MODEL, "nhead": NHEAD, "max_relative_dist": 4}
-)
-
-# 3. Test Generalization (From 8 bits up to 48 bits)
-test_lengths = [8, 12, 16, 20, 24, 32, 40, 48]
-std_acc = evaluate_length_generalization(std_model, "Standard", test_lengths)
-loop_acc = evaluate_length_generalization(looped_model, "Looped", test_lengths)
-
-# 4. Plot
-plt.figure(figsize=(10, 6))
-plt.plot(test_lengths, std_acc, 'o--', label='Standard Transformer (Absolute Pos)', color='red', linewidth=2)
-plt.plot(test_lengths, loop_acc, 'o-', label='Looped Transformer (Relative + Window)', color='green', linewidth=2)
-
-# Formatting
-plt.axvline(x=8, color='gray', linestyle=':', label='Training Cutoff (8-bit)')
-plt.title('The "Grokking" Gap: Interpolation vs Extrapolation', fontsize=14)
-plt.xlabel('Sequence Length (Number of Bits)', fontsize=12)
-plt.ylabel('Accuracy', fontsize=12)
-plt.ylim(-0.05, 1.1)
-plt.grid(True, alpha=0.3)
-plt.legend()
-
-# Show or Save
-print("\nResults:")
-print(f"Lengths: {test_lengths}")
-print(f"Standard Acc: {std_acc}")
-print(f"Looped Acc:   {loop_acc}")
-
-plt.show() # If running in notebook
-# plt.savefig("generalization_plot.png") # If running in script
+train_and_compare()
