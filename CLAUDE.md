@@ -1,0 +1,5 @@
+- Keep code simple
+- Reuse components from different utils or model_parts.py across files where possible
+- Do NOT add emojis.
+- Keep comments concise, brief yet understandable
+- Do NOT delete existing comments unless you are changing code and the old comments are no longer relevant.

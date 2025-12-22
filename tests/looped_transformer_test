@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 import matplotlib.pyplot as plt
+import sys
+sys.path.append('..')
+from models.model_parts import CausalSelfAttention
 
 # Device Config
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,11 +49,13 @@ def generate_decimal_batch(batch_size, length):
 # ==========================================
 # 2. STANDARD DECIMAL TRANSFORMER
 # ==========================================
-class StandardDecimalTransformer(nn.Module):
+class BaseTransformer(nn.Module):
     def __init__(self, d_model, nhead, num_layers=4, max_len=100):
         super().__init__()
         # Embedding for digits 0-9
-        self.digit_embedding = nn.Embedding(10, d_model)
+        # self.digit_embedding = nn.Embedding(10, d_model)
+        self.digit_embedding_a = nn.Embedding(10, d_model // 2)
+        self.digit_embedding_b = nn.Embedding(10, d_model // 2)
         
         # Absolute Positional Encoding
         self.pos_embedding = nn.Parameter(torch.randn(1, max_len, d_model) * 0.1)
@@ -66,23 +71,85 @@ class StandardDecimalTransformer(nn.Module):
         
         # Embed the two input digits separately and sum them
         # x[:,:,0] is digit A, x[:,:,1] is digit B
-        emb_a = self.digit_embedding(x[:,:,0])
-        emb_b = self.digit_embedding(x[:,:,1])
-        h = emb_a + emb_b # Combine
+        # emb_a = self.digit_embedding(x[:,:,0])
+        # emb_b = self.digit_embedding(x[:,:,1])
+        # h = emb_a + emb_b # Combine
+        emb_a = self.digit_embedding_a(x[:,:,0])
+        emb_b = self.digit_embedding_b(x[:,:,1])
+        h = torch.cat([emb_a, emb_b], dim=-1)
         
         # Add position
         h = h + self.pos_embedding[:, :seq_len, :]
         
         h = self.transformer(h)
         return self.output_head(h)
+    
+class BaseTransformer2(nn.Module):
+    def __init__(self, d_model, nhead, num_layers=40, max_len=100, use_rope=True, causal=True, rope_type='2d'):
+        super().__init__()
+        self.digit_embedding = nn.Embedding(10, d_model)
+        self.digit_embedding_a = nn.Embedding(10, d_model // 2)
+        self.digit_embedding_b = nn.Embedding(10, d_model // 2)
+        self.use_rope = use_rope
+
+        if not use_rope:
+            self.pos_embedding = nn.Parameter(torch.randn(1, max_len, d_model) * 0.1)
+
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                'attn': CausalSelfAttention(d_model=d_model, n_head=nhead, max_len=max_len, use_rope=use_rope, causal=causal, rope_type=rope_type),
+                'ffn': nn.Sequential(
+                    nn.Linear(d_model, 2048),
+                    nn.ReLU(),
+                    nn.Linear(2048, d_model)
+                ),
+                'ln1': nn.LayerNorm(d_model),
+                'ln2': nn.LayerNorm(d_model)
+            })
+            for _ in range(num_layers)
+        ])
+        self.output_head = nn.Linear(d_model, 10)
+
+        # Should we try implementing relative bias??
+        
+    def get_relative_bias(self, seq_len, device):
+        range_vec = torch.arange(seq_len, device=device)
+        distance_mat = range_vec[None, :] - range_vec[:, None]
+        distance_mat_clamped = torch.clamp(distance_mat, -self.max_relative_dist, self.max_relative_dist)
+        final_indices = distance_mat_clamped + self.max_relative_dist
+        bias = self.relative_bias_table[0, :, final_indices.long()]
+        causal_mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=device), diagonal=1)
+        return bias + causal_mask.unsqueeze(0)
+
+    def forward(self, x, num_loops=1):
+        # emb_a = self.digit_embedding(x[:,:,0])
+        # emb_b = self.digit_embedding(x[:,:,1])
+        # h = emb_a + emb_b
+        
+        emb_a = self.digit_embedding_a(x[:,:,0])
+        emb_b = self.digit_embedding_b(x[:,:,1])
+        input_emb = torch.cat([emb_a, emb_b], dim=-1)
+        h = input_emb.clone()
+
+        if not self.use_rope:
+            h = h + self.pos_embedding[:, :x.shape[1], :]
+
+        for i in range(num_loops):
+            for layer in self.layers:
+                h = h + layer['attn'](layer['ln1'](h))
+                h = h + layer['ffn'](layer['ln2'](h))
+                h = h + input_emb
+
+        return self.output_head(h)
 
 # ==========================================
 # 3. LOOPED DECIMAL TRANSFORMER
 # ==========================================
-class LoopedDecimalTransformer(nn.Module):
+class LoopedTransformer(nn.Module):
     def __init__(self, d_model, nhead, max_relative_dist=4):
         super().__init__()
-        self.digit_embedding = nn.Embedding(10, d_model)
+        self.digit_embedding_a = nn.Embedding(10, d_model // 2)
+        self.digit_embedding_b = nn.Embedding(10, d_model // 2)
         
         # Relative Bias
         self.max_relative_dist = max_relative_dist
@@ -110,9 +177,9 @@ class LoopedDecimalTransformer(nn.Module):
             num_loops = seq_len + 5
 
         # Embed Inputs
-        emb_a = self.digit_embedding(x[:,:,0])
-        emb_b = self.digit_embedding(x[:,:,1])
-        input_emb = emb_a + emb_b
+        emb_a = self.digit_embedding_a(x[:,:,0])
+        emb_b = self.digit_embedding_b(x[:,:,1])
+        input_emb = torch.cat([emb_a, emb_b], dim=-1)
         h = input_emb.clone()
         
         relative_bias = self.get_relative_bias(seq_len, x.device)
@@ -128,13 +195,13 @@ class LoopedDecimalTransformer(nn.Module):
 # 4. TRAINING & PLOTTING
 # ==========================================
 def train_and_compare():
-    D_MODEL = 128 # Slightly larger for decimal complexity
+    D_MODEL = 256 # Slightly larger for decimal complexity
     NHEAD = 4
     
     # 1. Setup Models
-    std_model = StandardDecimalTransformer(D_MODEL, NHEAD, num_layers=4).to(device)
-    loop_model = LoopedDecimalTransformer(D_MODEL, NHEAD, max_relative_dist=4).to(device) # Window=4
-    
+    std_model = BaseTransformer(D_MODEL, NHEAD, num_layers=4).to(device)
+    loop_model = BaseTransformer2(D_MODEL, NHEAD, num_layers=4, use_rope=True, causal=True, rope_type='2d').to(device) # Window=4
+
     optimizers = {
         "Standard": optim.Adam(std_model.parameters(), lr=0.001),
         "Looped": optim.Adam(loop_model.parameters(), lr=0.001)
@@ -158,7 +225,7 @@ def train_and_compare():
         # Train Looped
         opt = optimizers["Looped"]
         opt.zero_grad()
-        out = loop_model(X, num_loops=12) # 8 digits + buffer
+        out = loop_model(X, num_loops=4) # 8 digits + buffer
         loss_loop = criterion(out.reshape(-1, 10), Y.reshape(-1))
         loss_loop.backward()
         opt.step()
@@ -167,7 +234,7 @@ def train_and_compare():
             print(f"Step {step}: Std Loss {loss_std.item():.3f} | Loop Loss {loss_loop.item():.3f}")
 
     print("\n--- Generalization Test (Length 8 to 24) ---")
-    lengths = [8, 12, 16, 20, 24]
+    lengths = [8, 12, 16, 20, 24, 30, 32,35, 40]
     std_accs = []
     loop_accs = []
     
@@ -181,7 +248,7 @@ def train_and_compare():
             std_accs.append(acc_s)
             
             # Test Looped (Scale loops with length)
-            out_loop = loop_model(X_test, num_loops=L + 5)
+            out_loop = loop_model(X_test, num_loops=L+4)
             acc_l = (out_loop.argmax(-1) == Y_test).float().mean().item()
             loop_accs.append(acc_l)
             
@@ -193,8 +260,8 @@ def train_and_compare():
 
     # Plot
     plt.figure(figsize=(8, 5))
-    plt.plot(lengths, std_accs, 'r-o', label='Standard (Memorization)')
-    plt.plot(lengths, loop_accs, 'g-o', label='Looped (Abstraction)')
+    plt.plot(lengths, std_accs, 'r-o', label='Base Transformer')
+    plt.plot(lengths, loop_accs, 'g-o', label='Base Transformer (causal)')
     plt.axvline(x=8, color='gray', linestyle='--', label='Training Cutoff')
     plt.title("Decimal Addition: Generalization to Long Numbers")
     plt.xlabel("Number of Digits")
@@ -202,5 +269,7 @@ def train_and_compare():
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.show()
+    
+    return std_model, loop_model
 
-train_and_compare()
+std_model, loop_model = train_and_compare()
