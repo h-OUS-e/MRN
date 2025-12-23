@@ -46,6 +46,87 @@ def generate_decimal_batch(batch_size, length):
         
     return torch.tensor(X).long().to(device), torch.tensor(Y).long().to(device)
 
+
+# Vocabulary mapping, 0 and 1 are binary digits.
+TOK = {
+    "0": 0, "1": 1,
+    "+": 2,
+    ">": 3,
+    "#": 4,
+    "*": 5,   # only used in y to mark "ignored" positions conceptually
+}
+# TODO: Implement the binary addition batch generator based on paper to see if paper tricks help other transformers generalize and if the reason they generalize is due to their syntax trick in input!!!
+
+def generate_binary_addition_batch(batch_size, length, max_seq_length=25, device='cpu'):
+    """
+    Generates a batch of binary addition tasks as described in Section 6.1.1 
+    of the Looped Transformers paper for Length Generalization.
+    
+    Notes on the format:
+    - Order: Standard (MSD first), explicitly NOT reversed 
+    - Format: "summand1 + summand2 > answer" (Implicit FOP structure) 
+    - Input: looks like "x1...operator...xn>#...#" or "10+11>###".
+    - Output: looks like "*...*x1...xn#" or "*****101##".
+    """
+    
+    
+    X_batch = []
+    Y_batch = []
+
+    for _ in range(batch_size):
+        # 1. Generate numbers
+        # The paper defines length as the number of digits in the summands
+        # Length here is max int represented in binary (e.g. 2 bits -> 3, 3 bits -> 7, 8 bits -> 255)
+        max_val = (2 ** length) - 1
+        a_int = random.randint(0, max_val)
+        b_int = random.randint(0, max_val)
+        c_int = a_int + b_int
+
+        # 2. Convert to Binary Lists (Standard Order / Big-Endian)
+        # The paper explicitly states: "we do not reverse the output".
+        # We enforce fixed length padding for inputs to match the paper's "n digits
+        def to_bin(val, width):
+            bin_str = f"{val:0{width}b}"
+            return [int(d) for d in bin_str]
+
+        a_seq = to_bin(a_int, length)
+        b_seq = to_bin(b_int, length)
+        # Output has one more digit than inputs.
+        c_seq = to_bin(c_int, length) # in paper it is length + 1, but that felt like cheating
+
+        # 3. Construct Sequences
+        # Format: Input 1 + Input 2 > Answer # 
+        
+        # The Query (Input) part: "011+010>"
+        query = a_seq + [TOK["+"]] + b_seq
+        if len(query) >= max_seq_length:
+            raise ValueError(f"Generated query length {len(query)} should be less than max_seq_length {max_seq_length}")
+        query = query + ([TOK["#"]] * (max_seq_length - len(query)))
+        
+        # The Answer part: "101#"
+        answer = c_seq 
+        if len(answer) >= max_seq_length:
+            raise ValueError(f"Generated answer length {len(answer)} should be less than max_seq_length {max_seq_length}")
+        answer = answer + ([TOK["#"]] * (max_seq_length - len(answer)))
+        
+        # # 4. Construct Full Tensors for FOP (Full Output Prediction)
+        # # In FOP, the input contains the query + placeholders for the answer[cite: 103].
+        # # The target contains the answer at the correct positions.
+        
+        # # Input: [Query] [EOS placeholders]
+        # # Paper says: "rest of the locations are filled with multiple EOS tokens"[cite: 103].
+        # input_seq = query + [TOK[">"]] + ([TOK["#"]] * len(answer))
+        
+        # # Target: [Ignored Query] [Answer]
+        # # In standard PyTorch CrossEntropy, we use -100 to ignore targets.
+        # # The paper says output locations before EOQ are ignored[cite: 104].
+        # target_seq = [-100] * (len(query)) + answer + ([TOK["#"]] * 2)
+
+        X_batch.append(query)
+        Y_batch.append(answer)
+
+    return torch.tensor(X_batch).long().to(device), torch.tensor(Y_batch).long().to(device)
+
 # ==========================================
 # 2. STANDARD DECIMAL TRANSFORMER
 # ==========================================
