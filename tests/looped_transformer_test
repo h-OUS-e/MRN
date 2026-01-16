@@ -307,6 +307,9 @@ def train_multiple_models(
     batch_size=64,
     lr=0.001,
     print_interval=500,
+    eval_interval=None,
+    eval_ood_length=None,
+    eval_batch_size=100,
     device='cuda'
 ):
     """
@@ -323,11 +326,16 @@ def train_multiple_models(
         batch_size: Batch size for training
         lr: Learning rate
         print_interval: Print loss every N steps
+        eval_interval: Evaluate accuracy every N steps (None to disable)
+        eval_ood_length: OOD length to track during training (None to disable)
+        eval_batch_size: Batch size for evaluation
         device: 'cuda' or 'cpu'
 
     Returns:
         models_dict: Dict mapping model names to trained models
         loss_history: Dict mapping model names to list of (step, loss) tuples
+        accuracy_history: Dict with 'train_length' and 'ood_length' keys, each containing
+                         dict mapping model names to list of (step, accuracy) tuples
     """
 
     # Phase 1: Setup Models and Optimizers
@@ -348,6 +356,15 @@ def train_multiple_models(
 
     # Loss tracking
     loss_history = {name: [] for name in models_dict.keys()}
+
+    # Accuracy tracking (if enabled)
+    accuracy_history = None
+    if eval_interval is not None and eval_ood_length is not None:
+        accuracy_history = {
+            'train_length': {name: [] for name in models_dict.keys()},
+            'ood_length': {name: [] for name in models_dict.keys()}
+        }
+
     criterion = nn.CrossEntropyLoss()
 
     # Phase 2: Training Loop
@@ -383,7 +400,41 @@ def train_multiple_models(
                                    for name in models_dict.keys()])
             print(f"Step {step}: {loss_str}")
 
-    return models_dict, loss_history
+        # Periodic evaluation (if enabled)
+        if accuracy_history is not None and step % eval_interval == 0:
+            with torch.no_grad():
+                # Evaluate on training length
+                X_train_eval, Y_train_eval = generate_binary_addition_batch(
+                    eval_batch_size, length=train_length, max_seq_length=100, device=device
+                )
+
+                # Evaluate on OOD length
+                X_ood_eval, Y_ood_eval = generate_binary_addition_batch(
+                    eval_batch_size, length=eval_ood_length, max_seq_length=100, device=device
+                )
+
+                for name, model in models_dict.items():
+                    config = next(c for c in model_configs if c['name'] == name)
+
+                    # Evaluate on training length
+                    if config['num_loops'] is not None:
+                        out_train = model(X_train_eval, num_loops=train_length + 4)
+                    else:
+                        out_train = model(X_train_eval)
+                    predictions_train = out_train.argmax(-1)
+                    acc_train = (predictions_train == Y_train_eval).float().mean().item()
+                    accuracy_history['train_length'][name].append((step, acc_train))
+
+                    # Evaluate on OOD length
+                    if config['num_loops'] is not None:
+                        out_ood = model(X_ood_eval, num_loops=eval_ood_length + 4)
+                    else:
+                        out_ood = model(X_ood_eval)
+                    predictions_ood = out_ood.argmax(-1)
+                    acc_ood = (predictions_ood == Y_ood_eval).float().mean().item()
+                    accuracy_history['ood_length'][name].append((step, acc_ood))
+
+    return models_dict, loss_history, accuracy_history
 
 def evaluate_models(
     models_dict,
@@ -582,6 +633,57 @@ def plot_evaluation_results(results_dict, train_length, model_names):
     plt.tight_layout()
     plt.show()
 
+def plot_accuracy_during_training(accuracy_history, train_length, ood_length, model_names):
+    """
+    Plot accuracy on training length vs OOD length during training.
+
+    Args:
+        accuracy_history: Dict with 'train_length' and 'ood_length' keys, each containing
+                         dict mapping model names to list of (step, accuracy) tuples
+        train_length: Training length for labeling
+        ood_length: OOD length for labeling
+        model_names: List of model names
+    """
+    plt.figure(figsize=(10, 6))
+
+    # Generate distinct colors and markers
+    colors = plt.cm.tab10(range(len(model_names)))
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+    linestyles = ['-', '--']
+
+    for idx, name in enumerate(model_names):
+        # Plot training length accuracy (solid line)
+        steps_train, accs_train = zip(*accuracy_history['train_length'][name])
+        plt.plot(steps_train, accs_train,
+                marker=markers[idx % len(markers)],
+                color=colors[idx],
+                linestyle=linestyles[0],
+                label=f'{name} (Length={train_length})',
+                linewidth=2,
+                markersize=6,
+                markevery=max(1, len(steps_train) // 10))
+
+        # Plot OOD length accuracy (dashed line, same color)
+        steps_ood, accs_ood = zip(*accuracy_history['ood_length'][name])
+        plt.plot(steps_ood, accs_ood,
+                marker=markers[idx % len(markers)],
+                color=colors[idx],
+                linestyle=linestyles[1],
+                label=f'{name} (Length={ood_length}, OOD)',
+                linewidth=2,
+                markersize=6,
+                markevery=max(1, len(steps_ood) // 10))
+
+    plt.xlabel('Training Step', fontsize=12)
+    plt.ylabel('Per-Digit Accuracy', fontsize=12)
+    plt.title('Accuracy During Training: In-Distribution vs Out-of-Distribution',
+              fontsize=14, fontweight='bold')
+    plt.ylim([0, 1.0])
+    plt.legend(loc='best', fontsize=9)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
 # Example usage
 model_configs = [
     {
@@ -634,7 +736,11 @@ model_configs = [
     }
 ]
 
-models_dict, loss_history = train_multiple_models(model_configs)
+models_dict, loss_history, accuracy_history = train_multiple_models(
+    model_configs,
+    eval_interval=500,  # Evaluate every 500 steps
+    eval_ood_length=16  # Track OOD performance at length 16
+)
 model_names = [c['name'] for c in model_configs]
 
 # Evaluate models
@@ -660,3 +766,7 @@ for i, L in enumerate(test_lengths):
 results_dict['loss_history'] = loss_history  # Add loss history to results for plotting
 plot_training_losses(loss_history, model_names)
 plot_evaluation_results(results_dict, train_length=8, model_names=model_names)
+
+# Plot accuracy during training (if tracking was enabled)
+if accuracy_history is not None:
+    plot_accuracy_during_training(accuracy_history, train_length=8, ood_length=16, model_names=model_names)
