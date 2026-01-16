@@ -1,3 +1,11 @@
+'''
+Attempting to test this paper and replicate results to understand
+how Looped Transformers work and why they generalize better.
+
+Paper: https://arxiv.org/pdf/2409.15647
+Github: https://github.com/UW-Madison-Lee-Lab/looped-tf
+'''
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,6 +23,23 @@ print(f"Running on: {device}")
 # 1. DECIMAL DATA GENERATOR
 # ==========================================
 def generate_decimal_batch(batch_size, length):
+    """
+    Generates a batch of decimal addition/subtraction problems.
+    
+    Args:
+        batch_size: Number of examples to generate
+        length: Number of digits in each operand (e.g., length=3 means 0-999)
+    
+    Returns:
+        X: [batch_size, seq_len, 2] - Input pairs of digits (digit_a, digit_b) at each position
+        Y: [batch_size, seq_len] - Target output digits (result of operation)
+    
+    Format:
+        - Digits stored in little-endian (least significant digit first)
+        - seq_len = length + 1 to accommodate carry/borrow
+        - X[i,j] = [a's j-th digit, b's j-th digit]
+        - Y[i,j] = result's j-th digit
+    """
     X, Y = [], []
     
     # We always define the sequence length as N + 1
@@ -56,7 +81,6 @@ TOK = {
     "*": 5,   # only used in y to mark "ignored" positions conceptually
 }
 # TODO: Implement the binary addition batch generator based on paper to see if paper tricks help other transformers generalize and if the reason they generalize is due to their syntax trick in input!!!
-
 def generate_binary_addition_batch(batch_size, length, max_seq_length=25, device='cpu'):
     """
     Generates a batch of binary addition tasks as described in Section 6.1.1 
@@ -67,8 +91,7 @@ def generate_binary_addition_batch(batch_size, length, max_seq_length=25, device
     - Format: "summand1 + summand2 > answer" (Implicit FOP structure) 
     - Input: looks like "x1...operator...xn>#...#" or "10+11>###".
     - Output: looks like "*...*x1...xn#" or "*****101##".
-    """
-    
+    """    
     
     X_batch = []
     Y_batch = []
@@ -134,9 +157,9 @@ class BaseTransformer(nn.Module):
     def __init__(self, d_model, nhead, num_layers=4, max_len=100):
         super().__init__()
         # Embedding for digits 0-9
-        # self.digit_embedding = nn.Embedding(10, d_model)
-        self.digit_embedding_a = nn.Embedding(10, d_model // 2)
-        self.digit_embedding_b = nn.Embedding(10, d_model // 2)
+        self.digit_embedding = nn.Embedding(10, d_model)
+        # self.digit_embedding_a = nn.Embedding(10, d_model // 2)
+        # self.digit_embedding_b = nn.Embedding(10, d_model // 2)
         
         # Absolute Positional Encoding
         self.pos_embedding = nn.Parameter(torch.randn(1, max_len, d_model) * 0.1)
@@ -155,9 +178,10 @@ class BaseTransformer(nn.Module):
         # emb_a = self.digit_embedding(x[:,:,0])
         # emb_b = self.digit_embedding(x[:,:,1])
         # h = emb_a + emb_b # Combine
-        emb_a = self.digit_embedding_a(x[:,:,0])
-        emb_b = self.digit_embedding_b(x[:,:,1])
-        h = torch.cat([emb_a, emb_b], dim=-1)
+        # emb_a = self.digit_embedding_a(x[:,:,0])
+        # emb_b = self.digit_embedding_b(x[:,:,1])
+        # h = torch.cat([emb_a, emb_b], dim=-1)
+        h=self.digit_embedding(x)
         
         # Add position
         h = h + self.pos_embedding[:, :seq_len, :]
@@ -169,8 +193,8 @@ class BaseTransformer2(nn.Module):
     def __init__(self, d_model, nhead, num_layers=40, max_len=100, use_rope=True, causal=True, rope_type='2d'):
         super().__init__()
         self.digit_embedding = nn.Embedding(10, d_model)
-        self.digit_embedding_a = nn.Embedding(10, d_model // 2)
-        self.digit_embedding_b = nn.Embedding(10, d_model // 2)
+        # self.digit_embedding_a = nn.Embedding(10, d_model // 2)
+        # self.digit_embedding_b = nn.Embedding(10, d_model // 2)
         self.use_rope = use_rope
 
         if not use_rope:
@@ -207,9 +231,10 @@ class BaseTransformer2(nn.Module):
         # emb_b = self.digit_embedding(x[:,:,1])
         # h = emb_a + emb_b
         
-        emb_a = self.digit_embedding_a(x[:,:,0])
-        emb_b = self.digit_embedding_b(x[:,:,1])
-        input_emb = torch.cat([emb_a, emb_b], dim=-1)
+        # emb_a = self.digit_embedding_a(x[:,:,0])
+        # emb_b = self.digit_embedding_b(x[:,:,1])
+        # input_emb = torch.cat([emb_a, emb_b], dim=-1)
+        input_emb = self.digit_embedding(x)
         h = input_emb.clone()
 
         if not self.use_rope:
@@ -275,82 +300,363 @@ class LoopedTransformer(nn.Module):
 # ==========================================
 # 4. TRAINING & PLOTTING
 # ==========================================
-def train_and_compare():
-    D_MODEL = 256 # Slightly larger for decimal complexity
-    NHEAD = 4
-    
-    # 1. Setup Models
-    std_model = BaseTransformer(D_MODEL, NHEAD, num_layers=4).to(device)
-    loop_model = BaseTransformer2(D_MODEL, NHEAD, num_layers=4, use_rope=True, causal=True, rope_type='2d').to(device) # Window=4
+def train_multiple_models(
+    model_configs,
+    num_steps=5000,
+    train_length=8,
+    batch_size=64,
+    lr=0.001,
+    print_interval=500,
+    device='cuda'
+):
+    """
+    Train multiple transformer models on binary addition.
 
-    optimizers = {
-        "Standard": optim.Adam(std_model.parameters(), lr=0.001),
-        "Looped": optim.Adam(loop_model.parameters(), lr=0.001)
-    }
-    
+    Args:
+        model_configs: List of dicts with keys:
+            - 'model_class': Model class (BaseTransformer, BaseTransformer2, LoopedTransformer)
+            - 'params': Dict of model initialization parameters
+            - 'name': Display name for plots/logs
+            - 'num_loops': Number of loops for inference (None for auto or non-looped models)
+        num_steps: Number of training steps
+        train_length: Length of numbers used during training
+        batch_size: Batch size for training
+        lr: Learning rate
+        print_interval: Print loss every N steps
+        device: 'cuda' or 'cpu'
+
+    Returns:
+        models_dict: Dict mapping model names to trained models
+        loss_history: Dict mapping model names to list of (step, loss) tuples
+    """
+
+    # Phase 1: Setup Models and Optimizers
+    models_dict = {}
+    optimizers_dict = {}
+
+    for config in model_configs:
+        model_class = config['model_class']
+        params = config['params']
+        name = config['name']
+
+        # Instantiate model
+        model = model_class(**params).to(device)
+        models_dict[name] = model
+
+        # Create optimizer
+        optimizers_dict[name] = optim.Adam(model.parameters(), lr=lr)
+
+    # Loss tracking
+    loss_history = {name: [] for name in models_dict.keys()}
     criterion = nn.CrossEntropyLoss()
-    
-    print("--- Training Phase (8-Digit Numbers) ---")
-    # Train both for 2000 steps
-    for step in range(2001):
-        X, Y = generate_decimal_batch(64, length=8)
-        
-        # Train Standard
-        opt = optimizers["Standard"]
-        opt.zero_grad()
-        out = std_model(X)
-        loss_std = criterion(out.reshape(-1, 10), Y.reshape(-1))
-        loss_std.backward()
-        opt.step()
-        
-        # Train Looped
-        opt = optimizers["Looped"]
-        opt.zero_grad()
-        out = loop_model(X, num_loops=4) # 8 digits + buffer
-        loss_loop = criterion(out.reshape(-1, 10), Y.reshape(-1))
-        loss_loop.backward()
-        opt.step()
-        
-        if step % 500 == 0:
-            print(f"Step {step}: Std Loss {loss_std.item():.3f} | Loop Loss {loss_loop.item():.3f}")
 
-    print("\n--- Generalization Test (Length 8 to 24) ---")
-    lengths = [8, 12, 16, 20, 24, 30, 32,35, 40]
-    std_accs = []
-    loop_accs = []
-    
-    for L in lengths:
+    # Phase 2: Training Loop
+    print(f"--- Training Phase ({train_length}-Digit Numbers) ---")
+    for step in range(num_steps + 1):
+        X, Y = generate_binary_addition_batch(batch_size, length=train_length, device=device)
+
+        # Train each model
+        for name, model in models_dict.items():
+            optimizer = optimizers_dict[name]
+            config = next(c for c in model_configs if c['name'] == name)
+
+            optimizer.zero_grad()
+
+            # Forward pass (handle num_loops for looped models)
+            if config['num_loops'] is not None:
+                out = model(X, num_loops=config['num_loops'])
+            else:
+                out = model(X)
+
+            # Loss computation
+            loss = criterion(out.reshape(-1, 10), Y.reshape(-1))
+            loss.backward()
+            optimizer.step()
+
+            # Track loss
+            if step % print_interval == 0:
+                loss_history[name].append((step, loss.item()))
+
+        # Print progress
+        if step % print_interval == 0:
+            loss_str = " | ".join([f"{name} Loss {loss_history[name][-1][1]:.3f}"
+                                   for name in models_dict.keys()])
+            print(f"Step {step}: {loss_str}")
+
+    return models_dict, loss_history
+
+def evaluate_models(
+    models_dict,
+    model_configs,
+    test_lengths=None,
+    per_digit_position_length=None,
+    batch_size=100,
+    device='cuda'
+):
+    """
+    Evaluate multiple trained models on binary addition task.
+
+    Args:
+        models_dict: Dict mapping model names to trained models
+        model_configs: List of model config dicts (same as used in training)
+        test_lengths: List of sequence lengths to test (default: [2,4,6,...,28])
+        per_digit_position_length: Length to use for per-digit position accuracy analysis
+                                   (default: None, will use first test_length)
+        batch_size: Batch size for evaluation
+        device: 'cuda' or 'cpu'
+
+    Returns:
+        results_dict: Dict with keys:
+            - 'length_generalization': Dict mapping model names to per-digit accuracy lists
+            - 'exact_match_accuracy': Dict mapping model names to exact match accuracy lists
+            - 'per_digit_accuracy': Dict mapping model names to per-position accuracy arrays
+            - 'test_lengths': List of test lengths used
+            - 'per_digit_position_length': Length used for per-digit position analysis
+    """
+    print("\n--- Generalization Test ---")
+    if test_lengths is None:
+        test_lengths = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28]
+
+    if per_digit_position_length is None:
+        per_digit_position_length = test_lengths[0]
+
+    # Initialize result storage
+    length_accuracies = {name: [] for name in models_dict.keys()}
+    exact_match_accuracies = {name: [] for name in models_dict.keys()}
+    per_digit_accuracies = {name: [] for name in models_dict.keys()}
+
+    # Test each length
+    for L in test_lengths:
         with torch.no_grad():
-            X_test, Y_test = generate_decimal_batch(100, length=L)
-            
-            # Test Standard
-            out_std = std_model(X_test)
-            acc_s = (out_std.argmax(-1) == Y_test).float().mean().item()
-            std_accs.append(acc_s)
-            
-            # Test Looped (Scale loops with length)
-            out_loop = loop_model(X_test, num_loops=L+4)
-            acc_l = (out_loop.argmax(-1) == Y_test).float().mean().item()
-            loop_accs.append(acc_l)
-            
-    # Print Table
-    print(f"{'Length':<10} | {'Standard Acc':<15} | {'Looped Acc':<15}")
-    print("-" * 45)
-    for i, L in enumerate(lengths):
-        print(f"{L:<10} | {std_accs[i]:.2f}{'':<11} | {loop_accs[i]:.2f}")
+            X_test, Y_test = generate_binary_addition_batch(
+                batch_size, length=L, max_seq_length=100, device=device
+            )
 
-    # Plot
-    plt.figure(figsize=(8, 5))
-    plt.plot(lengths, std_accs, 'r-o', label='Base Transformer')
-    plt.plot(lengths, loop_accs, 'g-o', label='Base Transformer (causal)')
-    plt.axvline(x=8, color='gray', linestyle='--', label='Training Cutoff')
-    plt.title("Decimal Addition: Generalization to Long Numbers")
-    plt.xlabel("Number of Digits")
-    plt.ylabel("Accuracy")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+            for name, model in models_dict.items():
+                config = next(c for c in model_configs if c['name'] == name)
+
+                # Inference with appropriate num_loops
+                if config['num_loops'] is not None:
+                    # Scale loops with length (L + buffer)
+                    out = model(X_test, num_loops=L + 4)
+                else:
+                    out = model(X_test)
+
+                # Overall accuracy (per-digit)
+                predictions = out.argmax(-1)
+                acc = (predictions == Y_test).float().mean().item()
+                length_accuracies[name].append(acc)
+
+                # Exact match accuracy (entire sequence must be correct)
+                exact_matches = (predictions == Y_test).all(dim=1).float().mean().item()
+                exact_match_accuracies[name].append(exact_matches)
+
+                # Per-digit position accuracy (at specified length)
+                if L == per_digit_position_length:
+                    per_pos_acc = []
+                    for pos in range(min(10, Y_test.shape[1])):
+                        pos_acc = (predictions[:, pos] == Y_test[:, pos]).float().mean().item()
+                        per_pos_acc.append(pos_acc)
+                    per_digit_accuracies[name] = per_pos_acc
+
+    # Build results dictionary
+    results_dict = {
+        'length_generalization': length_accuracies,
+        'exact_match_accuracy': exact_match_accuracies,
+        'per_digit_accuracy': per_digit_accuracies,
+        'test_lengths': test_lengths,
+        'per_digit_position_length': per_digit_position_length
+    }
+
+    return results_dict
+
+def plot_training_losses(loss_history, model_names):
+    """
+    Create training loss curves for all models.
+
+    Args:
+        loss_history: Dict mapping model names to list of (step, loss) tuples
+        model_names: List of model names (for ordering)
+    """
+    plt.figure(figsize=(10, 6))
+
+    # Generate distinct colors and markers
+    colors = plt.cm.tab10(range(len(model_names)))
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+
+    for idx, name in enumerate(model_names):
+        steps, losses = zip(*loss_history[name])
+        plt.plot(steps, losses,
+                marker=markers[idx % len(markers)],
+                color=colors[idx],
+                label=name,
+                linewidth=2,
+                markersize=6,
+                markevery=max(1, len(steps) // 10))
+
+    plt.xlabel('Training Step', fontsize=12)
+    plt.ylabel('Loss (log scale)', fontsize=12)
+    plt.title('Training Loss Curves', fontsize=14, fontweight='bold')
+    plt.yscale('log')
+    plt.legend(loc='best')
+    plt.grid(True, alpha=0.3, which='both')
+    plt.tight_layout()
     plt.show()
-    
-    return std_model, loop_model
 
-std_model, loop_model = train_and_compare()
+def plot_evaluation_results(results_dict, train_length, model_names):
+    """
+    Create figure with three subplots:
+    1. Per-digit position accuracy (positions 0-9)
+    2. Length generalization - per-digit accuracy (lengths 2-28)
+    3. Length generalization - exact match accuracy (lengths 2-28)
+
+    Args:
+        results_dict: Results dictionary with accuracy data (from evaluate_models)
+        train_length: Training length for reference line in plots
+        model_names: List of model names
+    """
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
+
+    # Generate distinct colors and markers
+    colors = plt.cm.tab10(range(len(model_names)))
+    markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+
+    # Subplot 1: Per-Digit Position Accuracy
+    for idx, name in enumerate(model_names):
+        per_digit_acc = results_dict['per_digit_accuracy'][name]
+        positions = list(range(len(per_digit_acc)))
+        ax1.plot(positions, per_digit_acc,
+                marker=markers[idx % len(markers)],
+                color=colors[idx],
+                label=name,
+                linewidth=2,
+                markersize=8)
+
+    ax1.set_xlabel('Output Position (Digit Index)', fontsize=12)
+    ax1.set_ylabel('Accuracy', fontsize=12)
+    ax1.set_title('Per-Digit Position Accuracy', fontsize=14, fontweight='bold')
+    ax1.set_ylim([0, 1.0])
+    ax1.legend(loc='best')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(range(10))
+
+    # Subplot 2: Length Generalization (Per-Digit)
+    test_lengths = results_dict['test_lengths']
+    for idx, name in enumerate(model_names):
+        length_acc = results_dict['length_generalization'][name]
+        ax2.plot(test_lengths, length_acc,
+                marker=markers[idx % len(markers)],
+                color=colors[idx],
+                label=name,
+                linewidth=2,
+                markersize=6)
+
+    ax2.axvline(x=train_length, color='gray', linestyle='--',
+                linewidth=2, label='Training Cutoff', alpha=0.7)
+    ax2.set_xlabel('Number of Digits', fontsize=12)
+    ax2.set_ylabel('Per-Digit Accuracy', fontsize=12)
+    ax2.set_title('Length Generalization (Per-Digit)', fontsize=14, fontweight='bold')
+    ax2.set_ylim([0, 1.0])
+    ax2.legend(loc='best')
+    ax2.grid(True, alpha=0.3)
+
+    # Subplot 3: Length Generalization (Exact Match)
+    for idx, name in enumerate(model_names):
+        exact_match_acc = results_dict['exact_match_accuracy'][name]
+        ax3.plot(test_lengths, exact_match_acc,
+                marker=markers[idx % len(markers)],
+                color=colors[idx],
+                label=name,
+                linewidth=2,
+                markersize=6)
+
+    ax3.axvline(x=train_length, color='gray', linestyle='--',
+                linewidth=2, label='Training Cutoff', alpha=0.7)
+    ax3.set_xlabel('Number of Digits', fontsize=12)
+    ax3.set_ylabel('Exact Match Accuracy', fontsize=12)
+    ax3.set_title('Length Generalization (Exact Match)', fontsize=14, fontweight='bold')
+    ax3.set_ylim([0, 1.0])
+    ax3.legend(loc='best')
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+# Example usage
+model_configs = [
+    {
+        'model_class': BaseTransformer,
+        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4},
+        'name': 'Standard',
+        'num_loops': None
+    },
+    {
+        'model_class': BaseTransformer2,
+        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+                  'use_rope': True, 'causal': False, 'rope_type': '2d'},
+        'name': 'RoPE Only',
+        'num_loops': None
+    },
+    {
+        'model_class': BaseTransformer2,
+        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+                  'use_rope': False, 'causal': True, 'rope_type': '2d'},
+        'name': 'Causal Only',
+        'num_loops': None
+    },
+    {
+        'model_class': BaseTransformer2,
+        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+                  'use_rope': False, 'causal': False, 'rope_type': '2d'},
+        'name': 'Nothing (for reference) ',
+        'num_loops': None
+    },
+    {
+        'model_class': BaseTransformer2,
+        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+                  'use_rope': True, 'causal': True, 'rope_type': '2d'},
+        'name': 'RoPE Causal',
+        'num_loops': None
+    },
+    {
+        'model_class': BaseTransformer2,
+        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+                  'use_rope': True, 'causal': True, 'rope_type': '2d'},
+        'name': 'RoPE Causal Looped 4',
+        'num_loops': 4
+    },
+    {
+        'model_class': BaseTransformer2,
+        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+                  'use_rope': True, 'causal': True, 'rope_type': '2d'},
+        'name': 'RoPE Causal Looped 8',
+        'num_loops': 8
+    }
+]
+
+models_dict, loss_history = train_multiple_models(model_configs)
+model_names = [c['name'] for c in model_configs]
+
+# Evaluate models
+results_dict = evaluate_models(
+    models_dict,
+    model_configs,
+    test_lengths=None,  # Use default [2,4,6,...,28]
+    per_digit_position_length=8,  # Analyze position accuracy at training length
+    device='cuda'
+)
+
+# Print results table
+print("\n--- Results Table ---")
+test_lengths = results_dict['test_lengths']
+print(f"{'Length':<10} | " + " | ".join([f"{name:<15}" for name in model_names]))
+print("-" * (12 + len(model_names) * 18))
+for i, L in enumerate(test_lengths):
+    acc_str = " | ".join([f"{results_dict['length_generalization'][name][i]:.2f}{'':<11}"
+                          for name in model_names])
+    print(f"{L:<10} | {acc_str}")
+
+# Generate plots
+results_dict['loss_history'] = loss_history  # Add loss history to results for plotting
+plot_training_losses(loss_history, model_names)
+plot_evaluation_results(results_dict, train_length=8, model_names=model_names)
