@@ -129,7 +129,7 @@ def default_aux_positions(x, block_size: int = 32):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model=512, n_head=12, max_len=1024, use_rope=True, causal=False, rope_type='2d', aux_positions_fn=None):
+    def __init__(self, d_model=512, n_head=12, max_len=1024, use_rope=True, causal=False, rope_type='2d', aux_positions_fn=None, dropout=0.0, use_relative_bias=False, max_relative_dist=4):
         super().__init__()
         assert d_model % n_head == 0
         self.head_dim = d_model // n_head
@@ -138,10 +138,15 @@ class CausalSelfAttention(nn.Module):
         self.causal = causal
         self.rope_type = rope_type
         self.aux_positions_fn = aux_positions_fn
+        self.dropout = dropout
 
         # Projections for Q, K, V
         self.c_attn = nn.Linear(d_model, 3 * d_model)
         self.c_proj = nn.Linear(d_model, d_model)
+
+        # Dropout layers to match PyTorch TransformerEncoderLayer
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
 
         # Initialize RoPE
         # NOTE: RoPE acts on the *head dimension*, not the model dimension
@@ -152,6 +157,26 @@ class CausalSelfAttention(nn.Module):
                 self.rope = RoPE(self.head_dim)
         else:
             self.rope = None
+
+        # Relative positional bias
+        self.use_relative_bias = use_relative_bias
+        if use_relative_bias:
+            self.max_relative_dist = max_relative_dist
+            self.relative_bias_table = nn.Parameter(
+                torch.Tensor(1, n_head, 2 * max_relative_dist + 1)
+            )
+            nn.init.xavier_uniform_(self.relative_bias_table)
+
+    def get_relative_bias(self, seq_len, device):
+        """Compute relative positional bias based on distance between positions."""
+        range_vec = torch.arange(seq_len, device=device)
+        distance_mat = range_vec[None, :] - range_vec[:, None]
+        distance_mat_clamped = torch.clamp(
+            distance_mat, -self.max_relative_dist, self.max_relative_dist
+        )
+        final_indices = distance_mat_clamped + self.max_relative_dist
+        bias = self.relative_bias_table[0, :, final_indices.long()]
+        return bias
 
     def forward(self, x):
         B, T, C = x.size() # Batch, Time (SeqLen), Channels (Dim)
@@ -193,17 +218,25 @@ class CausalSelfAttention(nn.Module):
         # Attention calculation
         att = (q @ k.transpose(-2, -1)) * (1.0 / (self.head_dim ** 0.5))
 
+        # Add relative positional bias if enabled
+        if self.use_relative_bias:
+            relative_bias = self.get_relative_bias(T, x.device)
+            att = att + relative_bias
+
         # Apply causal mask if enabled
         if self.causal:
             causal_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
             att = att.masked_fill(causal_mask, float('-inf'))
 
         att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
         y = att @ v # [B, Heads, T, Dim]
 
         # Reassemble
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.c_proj(y)
+        y = self.c_proj(y)
+        y = self.resid_dropout(y)
+        return y
 
 # --- Simple Transformer Wrapper ---
 

@@ -190,23 +190,42 @@ class BaseTransformer(nn.Module):
         return self.output_head(h)
     
 class BaseTransformer2(nn.Module):
-    def __init__(self, d_model, nhead, num_layers=40, max_len=100, use_rope=True, causal=True, rope_type='2d'):
+    def __init__(self, d_model, nhead, num_layers=4, max_len=100, use_rope=True, causal=True, rope_type='2d', dim_feedforward=None, dropout=0.0, activation='gelu', use_relative_bias=False, max_relative_dist=4):
         super().__init__()
         self.digit_embedding = nn.Embedding(10, d_model)
         # self.digit_embedding_a = nn.Embedding(10, d_model // 2)
         # self.digit_embedding_b = nn.Embedding(10, d_model // 2)
         self.use_rope = use_rope
 
+        # Match PyTorch default: 4 * d_model
+        if dim_feedforward is None:
+            dim_feedforward = 4 * d_model
+
         if not use_rope:
             self.pos_embedding = nn.Parameter(torch.randn(1, max_len, d_model) * 0.1)
 
+        # Choose activation function (PyTorch default is ReLU for TransformerEncoderLayer)
+        act_fn = nn.GELU() if activation == 'gelu' else nn.ReLU()
+
         self.layers = nn.ModuleList([
             nn.ModuleDict({
-                'attn': CausalSelfAttention(d_model=d_model, n_head=nhead, max_len=max_len, use_rope=use_rope, causal=causal, rope_type=rope_type),
+                'attn': CausalSelfAttention(
+                    d_model=d_model, 
+                    n_head=nhead, 
+                    max_len=max_len, 
+                    use_rope=use_rope, 
+                    causal=causal, 
+                    rope_type=rope_type, 
+                    dropout=dropout, 
+                    use_relative_bias=use_relative_bias, 
+                    max_relative_dist=max_relative_dist
+                ),
                 'ffn': nn.Sequential(
-                    nn.Linear(d_model, 2048),
-                    nn.ReLU(),
-                    nn.Linear(2048, d_model)
+                    nn.Linear(d_model, dim_feedforward),
+                    act_fn,
+                    nn.Dropout(dropout),
+                    nn.Linear(dim_feedforward, d_model),
+                    nn.Dropout(dropout)
                 ),
                 'ln1': nn.LayerNorm(d_model),
                 'ln2': nn.LayerNorm(d_model)
@@ -240,11 +259,17 @@ class BaseTransformer2(nn.Module):
         if not self.use_rope:
             h = h + self.pos_embedding[:, :x.shape[1], :]
 
-        for i in range(num_loops):
+        if num_loops is None:
             for layer in self.layers:
                 h = h + layer['attn'](layer['ln1'](h))
                 h = h + layer['ffn'](layer['ln2'](h))
-                h = h + input_emb
+            
+        else:
+            for i in range(num_loops):
+                for layer in self.layers:
+                    h = h + layer['attn'](layer['ln1'](h))
+                    h = h + layer['ffn'](layer['ln2'](h))
+                    h = h + input_emb
 
         return self.output_head(h)
 
@@ -302,7 +327,7 @@ class LoopedTransformer(nn.Module):
 # ==========================================
 def train_multiple_models(
     model_configs,
-    num_steps=5000,
+    num_steps=2001,
     train_length=8,
     batch_size=64,
     lr=0.001,
@@ -322,7 +347,9 @@ def train_multiple_models(
             - 'name': Display name for plots/logs
             - 'num_loops': Number of loops for inference (None for auto or non-looped models)
         num_steps: Number of training steps
-        train_length: Length of numbers used during training
+        train_length: Length of numbers used during training. Can be:
+                      - int: fixed length (e.g., 8)
+                      - str: range format (e.g., "2to8") for curriculum learning
         batch_size: Batch size for training
         lr: Learning rate
         print_interval: Print loss every N steps
@@ -367,10 +394,26 @@ def train_multiple_models(
 
     criterion = nn.CrossEntropyLoss()
 
+    # Parse train_length - either int or "XtoY" string format
+    if isinstance(train_length, str) and 'to' in train_length:
+        min_len, max_len = map(int, train_length.split('to'))
+        use_curriculum = True
+        train_length_display = f"{min_len}-{max_len}"
+    else:
+        min_len = max_len = int(train_length)
+        use_curriculum = False
+        train_length_display = str(train_length)
+
     # Phase 2: Training Loop
-    print(f"--- Training Phase ({train_length}-Digit Numbers) ---")
+    print(f"--- Training Phase ({train_length_display}-Digit Numbers) ---")
     for step in range(num_steps + 1):
-        X, Y = generate_binary_addition_batch(batch_size, length=train_length, device=device)
+        # Sample length for this batch
+        if use_curriculum:
+            current_length = random.randint(min_len, max_len)
+        else:
+            current_length = min_len
+
+        X, Y = generate_binary_addition_batch(batch_size, length=current_length, device=device)
 
         # Train each model
         for name, model in models_dict.items():
@@ -403,9 +446,10 @@ def train_multiple_models(
         # Periodic evaluation (if enabled)
         if accuracy_history is not None and step % eval_interval == 0:
             with torch.no_grad():
-                # Evaluate on training length
+                # Evaluate on training length (use max_len if curriculum)
+                eval_train_length = max_len
                 X_train_eval, Y_train_eval = generate_binary_addition_batch(
-                    eval_batch_size, length=train_length, max_seq_length=100, device=device
+                    eval_batch_size, length=eval_train_length, max_seq_length=100, device=device
                 )
 
                 # Evaluate on OOD length
@@ -418,7 +462,7 @@ def train_multiple_models(
 
                     # Evaluate on training length
                     if config['num_loops'] is not None:
-                        out_train = model(X_train_eval, num_loops=train_length + 4)
+                        out_train = model(X_train_eval, num_loops=eval_train_length + 4)
                     else:
                         out_train = model(X_train_eval)
                     predictions_train = out_train.argmax(-1)
@@ -586,7 +630,7 @@ def plot_evaluation_results(results_dict, train_length, model_names):
     ax1.set_xlabel('Output Position (Digit Index)', fontsize=12)
     ax1.set_ylabel('Accuracy', fontsize=12)
     ax1.set_title('Per-Digit Position Accuracy', fontsize=14, fontweight='bold')
-    ax1.set_ylim([0, 1.0])
+    # ax1.set_ylim([0, 1.0])
     ax1.legend(loc='best')
     ax1.grid(True, alpha=0.3)
     ax1.set_xticks(range(10))
@@ -607,7 +651,7 @@ def plot_evaluation_results(results_dict, train_length, model_names):
     ax2.set_xlabel('Number of Digits', fontsize=12)
     ax2.set_ylabel('Per-Digit Accuracy', fontsize=12)
     ax2.set_title('Length Generalization (Per-Digit)', fontsize=14, fontweight='bold')
-    ax2.set_ylim([0, 1.0])
+    # ax2.set_ylim([0, 1.0])
     ax2.legend(loc='best')
     ax2.grid(True, alpha=0.3)
 
@@ -626,7 +670,7 @@ def plot_evaluation_results(results_dict, train_length, model_names):
     ax3.set_xlabel('Number of Digits', fontsize=12)
     ax3.set_ylabel('Exact Match Accuracy', fontsize=12)
     ax3.set_title('Length Generalization (Exact Match)', fontsize=14, fontweight='bold')
-    ax3.set_ylim([0, 1.0])
+    # ax3.set_ylim([0, 1.0])
     ax3.legend(loc='best')
     ax3.grid(True, alpha=0.3)
 
@@ -678,7 +722,7 @@ def plot_accuracy_during_training(accuracy_history, train_length, ood_length, mo
     plt.ylabel('Per-Digit Accuracy', fontsize=12)
     plt.title('Accuracy During Training: In-Distribution vs Out-of-Distribution',
               fontsize=14, fontweight='bold')
-    plt.ylim([0, 1.0])
+    # plt.ylim([0, 1.0])
     plt.legend(loc='best', fontsize=9)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -686,26 +730,12 @@ def plot_accuracy_during_training(accuracy_history, train_length, ood_length, mo
 
 # Example usage
 model_configs = [
-    {
-        'model_class': BaseTransformer,
-        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4},
-        'name': 'Standard',
-        'num_loops': None
-    },
-    {
-        'model_class': BaseTransformer2,
-        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
-                  'use_rope': True, 'causal': False, 'rope_type': '2d'},
-        'name': 'RoPE Only',
-        'num_loops': None
-    },
-    {
-        'model_class': BaseTransformer2,
-        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
-                  'use_rope': False, 'causal': True, 'rope_type': '2d'},
-        'name': 'Causal Only',
-        'num_loops': None
-    },
+    # {
+    #     'model_class': BaseTransformer,
+    #     'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4},
+    #     'name': 'Standard',
+    #     'num_loops': None
+    # },
     {
         'model_class': BaseTransformer2,
         'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
@@ -716,6 +746,41 @@ model_configs = [
     {
         'model_class': BaseTransformer2,
         'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+                  'use_rope': True, 'causal': False, 'rope_type': '2d'},
+        'name': 'RoPE Only',
+        'num_loops': None
+    },
+    # {
+    #     'model_class': BaseTransformer2,
+    #     'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+    #               'use_rope': False, 'causal': True, 'rope_type': '2d'},
+    #     'name': 'Causal Only',
+    #     'num_loops': None
+    # },    
+    # {
+    #     'model_class': BaseTransformer2,
+    #     'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+    #               'use_rope': False, 'causal': False, 'rope_type': '2d', 'use_relative_bias': True, 'max_relative_dist': 4},
+    #     'name': 'Relative Only',
+    #     'num_loops': None
+    # },   
+    # {
+    #     'model_class': BaseTransformer2,
+    #     'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+    #               'use_rope': False, 'causal': True, 'rope_type': '2d', 'use_relative_bias': True, 'max_relative_dist': 4},
+    #     'name': 'Relative Causal ',
+    #     'num_loops': None
+    # },   
+    {        
+        'model_class': BaseTransformer2,
+        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+                  'use_rope': True, 'causal': False, 'rope_type': '2d', 'use_relative_bias': True, 'max_relative_dist': 4},
+        'name': 'RoPE Relative  ',
+        'num_loops': None
+    },   
+    {
+        'model_class': BaseTransformer2,
+        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
                   'use_rope': True, 'causal': True, 'rope_type': '2d'},
         'name': 'RoPE Causal',
         'num_loops': None
@@ -723,21 +788,29 @@ model_configs = [
     {
         'model_class': BaseTransformer2,
         'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
-                  'use_rope': True, 'causal': True, 'rope_type': '2d'},
-        'name': 'RoPE Causal Looped 4',
-        'num_loops': 4
-    },
-    {
-        'model_class': BaseTransformer2,
-        'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
-                  'use_rope': True, 'causal': True, 'rope_type': '2d'},
-        'name': 'RoPE Causal Looped 8',
-        'num_loops': 8
-    }
+                  'use_rope': True, 'causal': True, 'rope_type': '2d', 'use_relative_bias': True, 'max_relative_dist': 4},
+        'name': 'RoPE Causal Relative Bias',
+        'num_loops': None
+    },   
+    # {
+    #     'model_class': BaseTransformer2,
+    #     'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+    #               'use_rope': True, 'causal': True, 'rope_type': '2d'},
+    #     'name': 'RoPE Causal Looped 4',
+    #     'num_loops': 4
+    # },
+    # {
+    #     'model_class': BaseTransformer2,
+    #     'params': {'d_model': 256, 'nhead': 4, 'num_layers': 4,
+    #               'use_rope': True, 'causal': True, 'rope_type': '2d'},
+    #     'name': 'RoPE Causal Looped 8',
+    #     'num_loops': 8
+    # }
 ]
 
 models_dict, loss_history, accuracy_history = train_multiple_models(
     model_configs,
+    num_steps=100001,
     eval_interval=500,  # Evaluate every 500 steps
     eval_ood_length=16  # Track OOD performance at length 16
 )
