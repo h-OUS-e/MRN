@@ -152,7 +152,7 @@ class TRMCriterion(nn.Module):
         # Halting loss: trains Q-head to predict whether the full sequence is correct (binary yes/no).
         # This is combined with LM loss (which gives partial credit per token) at 0.5 weight
         # since getting the answer right matters more than knowing when to stop.
-        final_loss = lm_loss + 0.5 * halt_loss # TODO: what if we increase weight of halt loss
+        total_loss = lm_loss + 0.5 * halt_loss # TODO: what if we increase weight of halt loss
         
         # metrics
         token_acc = (
@@ -165,11 +165,11 @@ class TRMCriterion(nn.Module):
         info = {
             "loss/lm": lm_loss.detach(),
             "loss/halt": halt_loss.detach(),
-            "loss/total": loss.detach(),
+            "loss/total": total_loss.detach(),
             "halt/seq_correct": seq_correct,
             "halt/token_correct": token_correct,
             "metric/seq_acc": seq_acc.detach(),
             "metric/token_acc": token_acc.detach(),
         }
 
-        return loss, info
+        return total_loss, info
